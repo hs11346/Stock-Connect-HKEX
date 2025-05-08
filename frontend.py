@@ -95,7 +95,7 @@ def fetch_df_from_redis_cached(date_key_str, _r_conn_placeholder):
         json_data = r.get(date_key_str)
         if json_data:
             return deserialize_df_from_redis(json_data)
-        st.warning(f"No data found in Redis for key: {date_key_str}")
+        # Removed st.warning from here to avoid spamming if a date legitimately has no data
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Error fetching data for {date_key_str} from Redis: {e}")
@@ -121,23 +121,26 @@ def get_historical_data_for_stock(selected_stock_code, available_dates, num_days
         return pd.DataFrame()
 
     stock_data_list = []
-    dates_to_fetch = available_dates[:num_days] # Get the most recent N dates
+    # Ensure we don't try to fetch more dates than available
+    dates_to_fetch = available_dates[:min(num_days, len(available_dates))] 
 
     for date_str in dates_to_fetch:
         daily_df = fetch_df_from_redis_cached(date_str, st.session_state.get('redis_connected'))
         if not daily_df.empty and 'Stock Code' in daily_df.columns:
-            stock_specific_data = daily_df[daily_df['Stock Code'] == selected_stock_code]
+            # Ensure selected_stock_code is of the same type as in DataFrame for comparison
+            stock_specific_data = daily_df[daily_df['Stock Code'] == int(selected_stock_code)]
             if not stock_specific_data.empty:
                 stock_data_list.append(stock_specific_data)
     
     if not stock_data_list:
         return pd.DataFrame()
     
-    # Concatenate all found data, ensuring 'ScrapeDate' is present
     full_stock_history = pd.concat(stock_data_list, ignore_index=True)
     if 'ScrapeDate' not in full_stock_history.columns:
-         st.warning("ScrapeDate column missing in concatenated historical data.")
-         return pd.DataFrame()
+         # Attempt to infer ScrapeDate from the key if it's missing in the df (should ideally be there)
+         # This is a fallback, the scraper should ensure ScrapeDate is in the stored DF.
+         st.warning("ScrapeDate column missing in concatenated historical data. This might affect chart accuracy.")
+         return pd.DataFrame() # Or handle by trying to add it based on keys
          
     return full_stock_history.sort_values(by='ScrapeDate')
 
@@ -145,51 +148,60 @@ def get_historical_data_for_stock(selected_stock_code, available_dates, num_days
 def get_closest_available_df(target_date_dt, available_dates_sorted, max_lookback_days=7):
     """
     Finds the DataFrame for target_date_dt or the closest previous available date within max_lookback_days.
+    Returns the DataFrame and the actual date string for which data was found.
     """
     r = get_redis_connection()
     if not r or not st.session_state.get('redis_connected', False):
-        return None, None
+        return pd.DataFrame(), None # Return empty DF and None for date string
 
-    for i in range(max_lookback_days + 1):
+    for i in range(max_lookback_days + 1): # Check target_date_dt first, then go back
         current_check_date_dt = target_date_dt - timedelta(days=i)
         current_check_date_str = current_check_date_dt.strftime("%Y-%m-%d")
         if current_check_date_str in available_dates_sorted:
             df = fetch_df_from_redis_cached(current_check_date_str, st.session_state.get('redis_connected'))
             if df is not None and not df.empty:
                 return df, current_check_date_str
-    return None, None
+    return pd.DataFrame(), None # Return empty DF and None if no suitable data found
 
-
-# --- Pub/Sub Listener (Simplified: Triggers rerun on next interaction if new data flag is set) ---
+# --- Pub/Sub Listener ---
 def redis_pubsub_listener():
     """Listens to Redis Pub/Sub and sets a flag in session_state on new messages."""
     if not st.session_state.get('redis_connected', False):
+        print("Pub/Sub: Redis not connected, listener not starting.")
         return
 
-    r_pubsub = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
-    pubsub = r_pubsub.pubsub()
+    r_pubsub = None
+    pubsub = None
     try:
+        r_pubsub = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+        pubsub = r_pubsub.pubsub()
         pubsub.subscribe(REDIS_UPDATE_CHANNEL)
         st.session_state.pubsub_thread_running = True
-        print(f"Subscribed to Redis channel: {REDIS_UPDATE_CHANNEL}") # For console debugging
+        print(f"Pub/Sub: Subscribed to Redis channel: {REDIS_UPDATE_CHANNEL}")
         for message in pubsub.listen():
+            if not st.session_state.get('pubsub_thread_should_run', True): # Check flag to stop thread
+                print("Pub/Sub: Thread stop signal received.")
+                break
             if message and message['type'] == 'message':
-                print(f"Pub/Sub message received: {message['data']}") # For console debugging
+                print(f"Pub/Sub: Message received: {message['data']}")
                 st.session_state.new_data_arrived_time = datetime.now()
-                # Note: Direct st.rerun() from thread is problematic.
-                # The main app will check 'new_data_arrived_time'.
     except redis.exceptions.ConnectionError:
         st.session_state.pubsub_thread_running = False
-        print("Pub/Sub listener disconnected from Redis.") # For console debugging
+        print("Pub/Sub: Listener disconnected from Redis.")
     except Exception as e:
         st.session_state.pubsub_thread_running = False
-        print(f"Error in Pub/Sub listener: {e}") # For console debugging
+        print(f"Pub/Sub: Error in listener: {e}")
     finally:
         if pubsub:
-            pubsub.unsubscribe(REDIS_UPDATE_CHANNEL)
-            pubsub.close()
+            try:
+                pubsub.unsubscribe(REDIS_UPDATE_CHANNEL)
+                pubsub.close()
+            except Exception as e:
+                print(f"Pub/Sub: Error during unsubscribe/close: {e}")
+        if r_pubsub:
+             r_pubsub.close()
         st.session_state.pubsub_thread_running = False
-        print("Pub/Sub listener stopped.") # For console debugging
+        print("Pub/Sub: Listener stopped.")
 
 
 # --- Initialize Session State ---
@@ -203,38 +215,92 @@ if 'pubsub_thread_started' not in st.session_state:
     st.session_state.pubsub_thread_started = False
 if 'pubsub_thread_running' not in st.session_state:
     st.session_state.pubsub_thread_running = False
-if 'latest_df_cache' not in st.session_state: # Cache for the latest_df to avoid re-deriving stock options
+if 'pubsub_thread_should_run' not in st.session_state: # Flag to gracefully stop thread
+    st.session_state.pubsub_thread_should_run = True
+if 'latest_df_cache' not in st.session_state:
     st.session_state.latest_df_cache = None
     st.session_state.latest_df_date_str_cache = None
 
 
+# --- New Function for Identifying Newly Added Stocks ---
+def get_newly_added_stocks_df(current_df, historical_df, current_date_str, historical_date_str_actual):
+    """
+    Identifies stocks in current_df that are not in historical_df.
+    
+    Args:
+        current_df (pd.DataFrame): DataFrame for the most recent date.
+        historical_df (pd.DataFrame): DataFrame for the historical comparison date.
+                                      Can be None or empty if no data for that date.
+        current_date_str (str): The date string for current_df (e.g., "YYYY-MM-DD").
+        historical_date_str_actual (str): The actual date string for historical_df.
+                                          If historical_df is None/empty, this might indicate
+                                          the target date for which data was not found.
+
+    Returns:
+        pd.DataFrame: DataFrame with 'Stock Code', 'Name', 'Appeared on/after', 'Compared against date'.
+                      Returns an empty DataFrame if no new stocks or if current_df is empty.
+    """
+    if current_df.empty or 'Stock Code' not in current_df.columns:
+        return pd.DataFrame(columns=['Stock Code', 'Name', 'Appeared on/after', 'Compared against date'])
+
+    current_codes = set(current_df['Stock Code'].dropna().unique())
+
+    if historical_df is None or historical_df.empty or 'Stock Code' not in historical_df.columns:
+        # If no valid historical data, all current stocks are "new" relative to that missing point
+        # However, this might not be the desired behavior if we only want to show *truly* new stocks.
+        # For now, let's assume if historical_df is missing, we can't determine "newness" reliably for this period.
+        # Or, we could list all current_df stocks, but that might be misleading.
+        # Let's return an empty DF in this case, indicating we can't make the comparison.
+        # A message in the UI will explain this.
+        # st.caption(f"Cannot determine new additions compared to {historical_date_str_actual or 'target historical date'} as historical data is missing.")
+        return pd.DataFrame(columns=['Stock Code', 'Name', 'Appeared on/after', 'Compared against date'])
+
+
+    historical_codes = set(historical_df['Stock Code'].dropna().unique())
+    new_stock_codes = current_codes - historical_codes
+
+    if not new_stock_codes:
+        return pd.DataFrame(columns=['Stock Code', 'Name', 'Appeared on/after', 'Compared against date'])
+
+    # Get the details of these new codes from the current_df
+    # Ensure 'Name' column exists
+    if 'Name' not in current_df.columns:
+        newly_added_info = pd.DataFrame({'Stock Code': list(new_stock_codes)})
+        newly_added_info['Name'] = "N/A" # Placeholder if Name is missing
+    else:
+        newly_added_info = current_df[current_df['Stock Code'].isin(new_stock_codes)][['Stock Code', 'Name']].drop_duplicates().copy()
+    
+    newly_added_info['Appeared on/after'] = pd.to_datetime(current_date_str).strftime('%Y-%m-%d')
+    newly_added_info['Compared against date'] = pd.to_datetime(historical_date_str_actual).strftime('%Y-%m-%d') if historical_date_str_actual else "N/A"
+    
+    # Ensure Stock Code is int for display
+    newly_added_info['Stock Code'] = newly_added_info['Stock Code'].astype(int)
+    return newly_added_info.sort_values(by=['Name', 'Stock Code']).reset_index(drop=True)
+
+
 # --- Main Application ---
 def run_app():
-    # Establish Redis connection (or get from cache)
     r = get_redis_connection()
 
-    # Start Pub/Sub listener thread if not already started and Redis is connected
-    if r and st.session_state.redis_connected and not st.session_state.pubsub_thread_started:
-        listener = threading.Thread(target=redis_pubsub_listener, daemon=True)
-        listener.start()
+    if r and st.session_state.redis_connected and \
+       not st.session_state.get('pubsub_thread_started', False) and \
+       st.session_state.get('pubsub_thread_should_run', True):
+        listener_thread = threading.Thread(target=redis_pubsub_listener, daemon=True)
+        listener_thread.start()
         st.session_state.pubsub_thread_started = True
-        print("Pub/Sub listener thread started.") # For console debugging
+        print("Main App: Pub/Sub listener thread started.")
 
-    # Check for Pub/Sub updates
     if st.session_state.new_data_arrived_time and \
        st.session_state.new_data_arrived_time > st.session_state.last_app_run_time_for_pubsub_check:
         st.toast(f"New data detected at {st.session_state.new_data_arrived_time.strftime('%H:%M:%S')}. Refreshing...", icon="🔄")
-        # Clear relevant caches
         get_available_dates_sorted.clear()
         fetch_df_from_redis_cached.clear()
-        st.session_state.latest_df_cache = None # Clear specific cache
+        st.session_state.latest_df_cache = None
         st.session_state.last_app_run_time_for_pubsub_check = datetime.now()
-        # Small delay to allow UI to show toast before rerun
-        time.sleep(0.1)
+        time.sleep(0.1) # Brief pause for toast
         st.rerun()
 
     st.session_state.last_app_run_time_for_pubsub_check = datetime.now()
-
 
     st.title("HKEX Shareholding Dashboard")
     st.markdown("Visualizing shareholding data scraped from HKEXnews.")
@@ -242,11 +308,10 @@ def run_app():
     if not st.session_state.get('redis_connected', False) or not r:
         st.warning("Dashboard is currently offline. Waiting for Redis connection...")
         if st.button("Retry Connection"):
-            get_redis_connection.clear() # Clear resource cache to force re-connect
+            get_redis_connection.clear()
             st.rerun()
         return
 
-    # --- Load initial data for UI ---
     available_dates = get_available_dates_sorted(st.session_state.get('redis_connected'))
 
     if not available_dates:
@@ -255,43 +320,44 @@ def run_app():
 
     latest_date_str = available_dates[0]
     
-    # Use cached latest_df if available and for the same date
     if st.session_state.latest_df_cache is not None and st.session_state.latest_df_date_str_cache == latest_date_str:
         latest_df = st.session_state.latest_df_cache
     else:
         latest_df = fetch_df_from_redis_cached(latest_date_str, st.session_state.get('redis_connected'))
+        if latest_df.empty:
+             st.warning(f"No data loaded for the latest available date: {latest_date_str}. This might be a non-trading day or data is not yet available.")
         st.session_state.latest_df_cache = latest_df
         st.session_state.latest_df_date_str_cache = latest_date_str
 
-
     if latest_df.empty:
-        st.warning(f"Could not load data for the latest available date: {latest_date_str}. The data might be corrupted or missing.")
+        # This check is important. If latest_df is empty, subsequent operations will fail or be meaningless.
+        st.error(f"Critical: Could not load data for the latest date ({latest_date_str}). Dashboard cannot proceed with analysis for this date.")
         stock_options_list = ["No stocks available"]
     else:
         st.info(f"Displaying data as of: **{pd.to_datetime(latest_date_str).strftime('%A, %B %d, %Y')}**")
         stock_options_list = get_stock_options(latest_df)
 
+
     # --- Sidebar Controls ---
     st.sidebar.header("Chart Controls")
-
-    # Line Chart Controls
     st.sidebar.subheader("Individual Stock Trend")
     
     default_stock_index_line = 0
-    if "TENCENT (700)" in stock_options_list: # Default to Tencent if available
-        default_stock_index_line = stock_options_list.index("TENCENT (700)")
-    elif stock_options_list[0] != "No stocks available" and not latest_df.empty:
-        # Default to stock with highest shareholding if Tencent not found
-        try:
-            top_stock = latest_df.nlargest(1, 'Shareholding in CCASS')
-            if not top_stock.empty:
-                top_stock_name = top_stock['Name'].iloc[0]
-                top_stock_code = int(top_stock['Stock Code'].iloc[0])
-                top_stock_option = f"{top_stock_name} ({top_stock_code})"
-                if top_stock_option in stock_options_list:
-                    default_stock_index_line = stock_options_list.index(top_stock_option)
-        except Exception:
-            pass # Keep default index 0
+    if stock_options_list[0] != "No stocks available": # Check if list is not just the placeholder
+        if "TENCENT (700)" in stock_options_list:
+            default_stock_index_line = stock_options_list.index("TENCENT (700)")
+        elif not latest_df.empty: # Ensure latest_df is not empty before trying to use it
+            try:
+                top_stock = latest_df.nlargest(1, 'Shareholding in CCASS')
+                if not top_stock.empty:
+                    top_stock_name = top_stock['Name'].iloc[0]
+                    top_stock_code = int(top_stock['Stock Code'].iloc[0])
+                    top_stock_option = f"{top_stock_name} ({top_stock_code})"
+                    if top_stock_option in stock_options_list:
+                        default_stock_index_line = stock_options_list.index(top_stock_option)
+            except Exception as e:
+                st.sidebar.warning(f"Could not determine default stock: {e}")
+
 
     selected_stock_option_line = st.sidebar.selectbox(
         "Select Stock:",
@@ -300,7 +366,6 @@ def run_app():
         key='selected_stock_line'
     )
 
-    # Bar Chart Controls
     st.sidebar.subheader("Market Movers")
     bar_change_period_map = {"1-Day": 1, "5-Day": 5, "20-Day": 20}
     bar_change_period_label = st.sidebar.radio(
@@ -328,12 +393,11 @@ def run_app():
     bar_n_movers, bar_top_movers = bar_display_scope_map[bar_display_scope_label]
 
     # --- Main Area: Charts ---
-
     st.subheader(f"Shareholding Trend")
     if selected_stock_option_line != "No stocks available" and selected_stock_option_line is not None:
         try:
-            # Extract stock code (it's an integer)
-            selected_stock_code = int(selected_stock_option_line.split('(')[-1][:-1])
+            selected_stock_code_str = selected_stock_option_line.split('(')[-1][:-1]
+            selected_stock_code = int(selected_stock_code_str)
             
             line_chart_data = get_historical_data_for_stock(selected_stock_code, available_dates, DEFAULT_DAYS_TO_LOAD_FOR_LINE_CHART)
 
@@ -357,55 +421,53 @@ def run_app():
     else:
         st.info("Select a stock from the sidebar to view its shareholding trend.")
 
-
     st.subheader(f"Shareholding Movers ({bar_change_period_label})")
     
-    current_day_df = latest_df # Already fetched
-    
-    if current_day_df.empty:
+    # current_day_df is latest_df
+    if latest_df.empty:
         st.warning("Cannot calculate movers: Latest daily data is unavailable.")
     else:
         target_historical_date_dt = pd.to_datetime(latest_date_str) - timedelta(days=bar_change_period_days)
-        historical_df, actual_historical_date_str = get_closest_available_df(target_historical_date_dt, available_dates)
+        # For movers, we need to look back further if the exact T-N day is not available.
+        # Max lookback for movers can be larger, e.g., period_days + a buffer
+        historical_df_movers, actual_historical_date_str_movers = get_closest_available_df(
+            target_historical_date_dt, available_dates, max_lookback_days=bar_change_period_days + 10 
+        )
 
-        if historical_df is None or historical_df.empty:
+        if historical_df_movers.empty:
             st.warning(f"Not enough historical data to calculate {bar_change_period_label} change. "
-                        f"Required historical data around {target_historical_date_dt.strftime('%Y-%m-%d')} not found.")
+                        f"Required historical data around {target_historical_date_dt.strftime('%Y-%m-%d')} not found within reasonable lookback.")
         else:
-            st.caption(f"Comparing data from {latest_date_str} with {actual_historical_date_str} (closest to T-{bar_change_period_days}).")
+            st.caption(f"Comparing data from {latest_date_str} with {actual_historical_date_str_movers} (closest to T-{bar_change_period_days} for movers calculation).")
             
-            # Merge current and historical data
             merged_df = pd.merge(
-                current_day_df[['Stock Code', 'Name', 'Shareholding in CCASS']],
-                historical_df[['Stock Code', 'Shareholding in CCASS']],
+                latest_df[['Stock Code', 'Name', 'Shareholding in CCASS']],
+                historical_df_movers[['Stock Code', 'Shareholding in CCASS']],
                 on='Stock Code',
                 suffixes=('_current', '_historical')
             )
 
             if merged_df.empty:
-                st.info("No common stocks found between the current and historical periods for comparison.")
+                st.info("No common stocks found between the current and historical periods for mover comparison.")
             else:
-                # Calculate change
                 if bar_change_metric == "Absolute (Shares)":
                     merged_df['Change'] = merged_df['Shareholding in CCASS_current'] - merged_df['Shareholding in CCASS_historical']
                     change_label = "Change in Shares"
                 else: # Percentage (%)
-                    # Handle division by zero or NaN if historical is 0 or missing
                     merged_df['Change'] = ((merged_df['Shareholding in CCASS_current'] - merged_df['Shareholding in CCASS_historical']) / merged_df['Shareholding in CCASS_historical']) * 100
-                    merged_df['Change'] = merged_df['Change'].replace([np.inf, -np.inf], np.nan) # Replace inf with NaN
+                    merged_df['Change'] = merged_df['Change'].replace([np.inf, -np.inf], np.nan)
                     change_label = "Change (%)"
                 
-                merged_df = merged_df.dropna(subset=['Change']) # Remove rows where change couldn't be calculated
+                merged_df = merged_df.dropna(subset=['Change'])
 
                 if not merged_df.empty:
-                    # Sort and select top/bottom N
                     merged_df = merged_df.sort_values(by='Change', ascending=(not bar_top_movers))
-                    movers_df = merged_df.head(bar_n_movers)
+                    movers_df_display = merged_df.head(bar_n_movers)
                     
-                    if not movers_df.empty:
-                        movers_df['StockLabel'] = movers_df['Name'] + " (" + movers_df['Stock Code'].astype(int).astype(str) + ")"
+                    if not movers_df_display.empty:
+                        movers_df_display['StockLabel'] = movers_df_display['Name'] + " (" + movers_df_display['Stock Code'].astype(int).astype(str) + ")"
                         fig_bar = px.bar(
-                            movers_df,
+                            movers_df_display,
                             x='StockLabel',
                             y='Change',
                             title=f"{bar_display_scope_label} - {bar_change_metric}",
@@ -418,8 +480,77 @@ def run_app():
                     else:
                         st.info(f"No stocks found for {bar_display_scope_label} criteria after filtering.")
                 else:
-                    st.info("No stocks with calculable changes found.")
-    st.dataframe(merged_df)
+                    st.info("No stocks with calculable changes found for movers.")
+
+    # --- New Component: Newly Added Stocks ---
+    st.markdown("---") # Visual separator
+    st.subheader("Newly Added Stocks Monitoring")
+
+    if latest_df.empty:
+        st.warning("Cannot determine newly added stocks: Latest daily data is unavailable.")
+    else:
+        periods_days = [1, 5, 20]
+        column_names_display = {'Stock Code': 'Code', 'Name': 'Stock Name', 'Appeared on/after': 'Latest Data Date', 'Compared against date': 'Previous Data Date'}
+
+
+        for days_back in periods_days:
+            st.markdown(f"#### New Additions in the Past ~{days_back} Day(s)")
+            
+            target_historical_date_new_additions = pd.to_datetime(latest_date_str) - timedelta(days=days_back)
+            
+            # For new additions, we typically want to compare against a single point in the past (T-days_back).
+            # max_lookback_days can be small, e.g., days_back + a small buffer, or even just 0 if we want strict T-days_back.
+            # Using a small lookback (e.g., 7 days around the target) to find *some* data if exact T-days_back is missing.
+            historical_df_new_additions, actual_historical_date_str_new = get_closest_available_df(
+                target_historical_date_new_additions, 
+                available_dates, 
+                max_lookback_days=days_back + 7 # Look around the target date
+            )
+
+            if historical_df_new_additions.empty:
+                st.caption(f"Could not find historical data around T-{days_back} ({target_historical_date_new_additions.strftime('%Y-%m-%d')}) to compare for new additions. "
+                           f"The scraper might need to populate more historical data, or this period might predate available data.")
+            else:
+                newly_added_stocks = get_newly_added_stocks_df(
+                    latest_df, 
+                    historical_df_new_additions, 
+                    latest_date_str, 
+                    actual_historical_date_str_new
+                )
+
+                if not newly_added_stocks.empty:
+                    st.caption(f"Showing stocks present in data for {pd.to_datetime(latest_date_str).strftime('%Y-%m-%d')} but not found in data for {pd.to_datetime(actual_historical_date_str_new).strftime('%Y-%m-%d')}.")
+                    st.dataframe(newly_added_stocks.rename(columns=column_names_display), use_container_width=True, hide_index=True)
+                else:
+                    st.info(f"No new stock code additions found when comparing {latest_date_str} with data from around T-{days_back} (specifically {actual_historical_date_str_new if actual_historical_date_str_new else 'target date'}).")
+    
+    # Add a small footer or status information
+    st.sidebar.markdown("---")
+    if st.session_state.get('redis_connected', False):
+        status_color = "green"
+        status_text = "Connected"
+    else:
+        status_color = "red"
+        status_text = "Disconnected"
+    st.sidebar.markdown(f"**Redis Status:** <span style='color:{status_color};'>{status_text}</span>", unsafe_allow_html=True)
+    
+    if st.session_state.get('pubsub_thread_running', False) :
+         st.sidebar.markdown(f"**Live Updates:** <span style='color:green;'>Active</span>", unsafe_allow_html=True)
+    elif st.session_state.get('pubsub_thread_started', False): # Started but not running (e.g. error)
+         st.sidebar.markdown(f"**Live Updates:** <span style='color:orange;'>Attempted (check logs)</span>", unsafe_allow_html=True)
+    else:
+         st.sidebar.markdown(f"**Live Updates:** <span style='color:red;'>Inactive</span>", unsafe_allow_html=True)
+
 
 if __name__ == "__main__":
-    run_app()
+    # Ensure graceful shutdown of the pubsub listener thread if app is stopped
+    try:
+        run_app()
+    except KeyboardInterrupt:
+        st.session_state.pubsub_thread_should_run = False
+        print("Application shutting down by KeyboardInterrupt...")
+        time.sleep(0.5) # Give thread a moment to see the flag
+    finally:
+        st.session_state.pubsub_thread_should_run = False
+        print("Application exited.")
+
