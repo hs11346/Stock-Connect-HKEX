@@ -4,6 +4,36 @@
 
 This project aims to provide a real-time Streamlit visualization dashboard & email automation system to display and analyze stock shareholding data scraped from the HKEXnews website. It allows users to track daily shareholding information and identify trends and significant changes.
 
+```mermaid
+graph TD
+    subgraph External Source
+        A[HKEXnews Website]
+    end
+
+    subgraph Data Processing 
+        B(Backend Scraper)
+        C[Data Store Redis]
+        L["scraper.log"] 
+    end
+
+    subgraph UserInterfaceAndReporting
+        D(Frontend - Streamlit)
+        E(Email Automation System)
+        U[User]
+        R[Email Recipients]
+    end
+
+    A -- "Daily Shareholding Data (via Selenium)" --> B;
+    B -- "Stores Serialized DataFrames (JSON) <br/> Publishes 'data_updated' Notification" --> C;
+    B -- "Writes Logs" --> L;
+
+    C -- "Subscribes to 'data_updated' <br/> Retrieves DataFrames" --> D;
+    D -- "Displays Visualizations <br/> Handles User Interactions" --> U;
+
+    C -- "Subscribes to 'data_updated' <br/> Retrieves DataFrames" --> E;
+    E -- "Generates Charts & Updates <br/> Sends Emails" --> R;
+```
+
 ## System Architecture
 
 The system is composed of Four main components:
