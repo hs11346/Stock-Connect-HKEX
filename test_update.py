@@ -29,10 +29,6 @@ DAYS_FOR_INITIAL_POPULATION = 60
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -301,7 +297,7 @@ class HKEXScraper:
         logger.info("Historical data population process finished.")
 
 
-    def scrape_current_day_data(self) -> bool:
+    def scrape_current_day_data(self,current_date) -> bool: # adjusted for selectable date
         """
         Scrapes data for the current day and stores it in Redis.
         Retries on failure.
@@ -309,7 +305,6 @@ class HKEXScraper:
         Returns:
             bool: True if data was successfully scraped and stored, False otherwise.
         """
-        current_date = datetime.today()
         date_key = current_date.strftime("%Y-%m-%d")
         logger.info("Attempting to scrape data for current day: %s", date_key)
 
@@ -390,31 +385,13 @@ if __name__ == "__main__":
     # For this example, let's assume we run it if a certain key is not present.
     # A more robust way would be a command-line argument or config.
     INITIAL_POP_MARKER_KEY = "initial_population_done_marker"
-    if True: # Run populate db each time first
-        logger.info("Running initial data population...")
-        try:
-            scraper.populate_historical_data(num_days=DAYS_FOR_INITIAL_POPULATION)
-            scraper.redis_client.set(INITIAL_POP_MARKER_KEY, "True") # Mark as done
-            logger.info("Initial data population completed.")
-        except Exception as e:
-            logger.critical("Failed during initial data population: %s", e, exc_info=True)
-        finally:
-            scraper.close_driver() # Close driver after population if not running continuously immediately
-    else:
-        logger.info("Initial population marker found or sufficient data exists. Skipping initial population.")
 
     # --- Continuous Scraping for Current Day ---
     # Ensure driver is ready for continuous mode if it was closed
-    if SCRAPE_CURRENT_DAY_CONTINUOUSLY and (not scraper.driver or not scraper.driver.session_id):
-        logger.info("Re-initializing driver for continuous scraping mode.")
-        scraper.close_driver() # ensure clean state
-        # No need to explicitly initialize here, scrape_current_day_data and run_continuous_scraper will handle it.
 
-    scraper.run_continuous_scraper(
-        interval_seconds=DEFAULT_SCRAPING_INTERVAL_SECONDS,
-        scrape_continuously_toggle=SCRAPE_CURRENT_DAY_CONTINUOUSLY
-    )
+    scraper.scrape_current_day_data(datetime(2025, 5, 9))
 
     # Fallback close driver if continuous mode is off and script somehow reaches here
     if not SCRAPE_CURRENT_DAY_CONTINUOUSLY:
         scraper.close_driver()
+
