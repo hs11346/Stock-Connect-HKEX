@@ -2,15 +2,16 @@
 
 ## Project Goal
 
-This project aims to provide a real-time (or near real-time) Streamlit visualization dashboard to display and analyze stock shareholding data scraped from the HKEXnews website. It allows users to track daily shareholding information and identify trends and significant changes.
+This project aims to provide a real-time Streamlit visualization dashboard & email automation system to display and analyze stock shareholding data scraped from the HKEXnews website. It allows users to track daily shareholding information and identify trends and significant changes.
 
 ## System Architecture
 
-The system is composed of three main components:
+The system is composed of Four main components:
 
 1.  **Backend Scraper (Python):** A Python application responsible for continuously scraping daily shareholding data from the HKEXnews website. It uses Selenium for web interaction.
 2.  **Data Store (Redis):** Redis serves as the primary database and cache. It stores the scraped shareholding data (Pandas DataFrames serialized as JSON) with dates as keys. The backend publishes update notifications to a Redis channel.
 3.  **Frontend (Streamlit):** A Streamlit web application that subscribes to Redis updates and visualizes the data. It offers interactive charts, including time-series line charts for individual stock shareholdings and bar charts for top/bottom movers based on customizable criteria.
+4. **Email Automation:** A Email Automation System that receives updates from the backend, and generates charts and updates to recipients. 
 
 ## Features
 
@@ -42,6 +43,11 @@ The system is composed of three main components:
     * Handles missing data for change calculations by using the closest available previous trading day.
 * User-friendly interface with controls in the sidebar.
 * Graceful error handling for data unavailability or connection issues.
+
+### Email Automation:
+* Real time updates from Backend server via Redis Pub/Sub
+* Generates Top and bottom movers chart
+* Display new additions to the Southbound db
 
 ## Setup and Installation
 
@@ -77,6 +83,9 @@ The system is composed of three main components:
     selenium
     plotly
     requests
+    smtplib
+    email
+    matplotlib
     # Add any other specific libraries used
     ```
     Then install them:
@@ -89,6 +98,9 @@ The system is composed of three main components:
 
 5.  **Configure Scraper (Optional):**
     * **Scraping Toggle & Interval:** The scraping frequency (default: 1 minute) and the toggle to enable/disable continuous scraping should be configurable. This might be managed via a `config.ini` file or environment variables (e.g., `SCRAPING_ENABLED=True`, `SCRAPING_INTERVAL_SECONDS=60`). Refer to the specific implementation.
+
+4.  **Configure Env file:**
+    Ensure your email credentials are in the environment file, which can be loaded by the `email_automation.py file`. 
 
 ## Running the Application
 
@@ -112,6 +124,12 @@ The system is composed of three main components:
     streamlit run app.py
     ```
     Open your web browser and go to the local URL provided by Streamlit (usually `http://localhost:8501`).
+
+3.  **Run the Email Automation System:**
+    Navigate to the directory containing the email automation script (e.g., `email_automation.py`) and run it:
+    ```bash
+    python email_automation.py
+    ```
 
 ## Logging
 The backend scraper logs its activities, errors, and retry attempts to `scraper.log` in the same directory where the scraper script is run.
