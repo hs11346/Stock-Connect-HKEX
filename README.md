@@ -1,4 +1,4 @@
-# HKEX Daily Shareholding Reporting System
+# HKEX Southbound Daily Shareholding Reporting System
 
 ## Project Goal
 
