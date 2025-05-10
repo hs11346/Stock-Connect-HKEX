@@ -1,4 +1,4 @@
-# HKEX Daily Shareholding Reporting System
+# HKEX Southbound Daily Shareholding Reporting System
 
 ## Project Goal
 
@@ -11,7 +11,7 @@ graph TD
     end
 
     subgraph Data Processing 
-        B(Backend Scraper)
+        B(Continuous Backend Scraper)
         C[Data Store Redis]
         L["scraper.log"] 
     end
